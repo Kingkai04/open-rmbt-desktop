@@ -23,7 +23,7 @@ export class SingleThreadResult {
     }
 
     addResult(newBytes: number, newNsec: number) {
-        Logger.I.info("New bytes: %d. New nsec: %d.", newBytes, newNsec)
+        //Logger.I.info("New bytes: %d. New nsec: %d.", newBytes, newNsec)
         let addToCoarse = this.coarseResults === 0
         if (!addToCoarse) {
             const diffTime =

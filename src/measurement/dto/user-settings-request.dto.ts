@@ -15,6 +15,7 @@ export class UserSettingsRequest implements IUserSettingsRequest {
     terms_and_conditions_accepted = true
     type = "DESKTOP"
     uuid = ""
+    capabilities = {"RMBThttp": true}
 
     constructor() {
         // TODO: store and read the stored UUID
