@@ -93,22 +93,29 @@ export class UploadMessageHandler implements IMessageHandler {
         }
     }
 
-    private putChunks() {
+    private async putChunks() {
         const statsTime = Time.nowNs() + UploadMessageHandler.statsIntervalTime
         let buffer = randomBytes(this.ctx.chunkSize)
+        this.ctx.client.on('drain', function() {
+            console.log("drain event")
+        })
+
+        let writeWithCallback = (buffer: any) => {
+            return new Promise((res,rej) => {
+                let canWrite = this.ctx.client.write(buffer, res)
+                if (!canWrite) {
+                    console.log("canwrite false")
+                }
+            });
+        }
+
         while (true) {
             let bufferGenStartTime = Time.nowNs()
             //let buffer = Buffer.from("a".repeat(this.ctx.chunkSize),"utf-8");// randomBytes(this.ctx.chunkSize)
             this.rngDelay = 0;// this.rngDelay + (Time.nowNs() - bufferGenStartTime)
             if (Time.nowNs() >= this.uploadEndTime) {
                 buffer[buffer.length - 1] = 0xff
-                this.ctx.client.on('drain', function() {
-                    console.log("drain event")
-                })
-                let canWrite = this.ctx.client.write(buffer)
-                if (!canWrite) {
-                    console.log("canwrite false")
-                }
+                await writeWithCallback(buffer)
 
                 if (!this.finalTimeout) {
                     this.finalTimeout = setTimeout(
