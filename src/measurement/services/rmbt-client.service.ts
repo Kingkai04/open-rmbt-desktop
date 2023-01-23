@@ -14,12 +14,12 @@ import { RMBTWorkerFactory } from "./rmbt-worker-factory.service"
 import { Time } from "./time.service"
 import path from "path"
 import { IOverallResult } from "../interfaces/overall-result.interface"
-import { IPreDownloadResult } from "./rmbt-thread.service"
+import { IPreDownloadResult, RMBTThread } from "./rmbt-thread.service"
 
 export class RMBTClient {
     measurementLastUpdate?: number
     measurementStatus: EMeasurementStatus = EMeasurementStatus.WAIT
-    measurementTasks: RMBTWorker[] = []
+    measurementTasks: RMBTThread[] = []
     minChunkSize = 0
     maxChunkSize = 4194304
     params: IMeasurementRegistrationResponse
@@ -99,7 +99,7 @@ export class RMBTClient {
     private async runMeasurement(): Promise<IMeasurementThreadResult[]> {
         this.isRunning = true
         this.measurementStart = Date.now()
-        return new Promise((finishMeasurement) => {
+        return new Promise(async (finishMeasurement) => {
             Logger.I.info("Running measurement...")
             this.activityInterval = setInterval(() => {
                 if (
@@ -115,9 +115,6 @@ export class RMBTClient {
                     this.interimThreadResults = new Array(
                         this.params.test_numthreads
                     )
-                    for (const w of this.measurementTasks) {
-                        w.terminate()
-                    }
                     clearInterval(this.activityInterval)
                     finishMeasurement([
                         ...this.downThreadResults,
@@ -140,241 +137,139 @@ export class RMBTClient {
             this.measurementStatus = EMeasurementStatus.INIT
             this.interimThreadResults = new Array(this.params.test_numthreads)
             this.phaseStartTimeNs[EMeasurementStatus.INIT] = Time.nowNs()
-            for (let i = 0; i < this.params.test_numthreads; i++) {
-                const worker = RMBTWorkerFactory.getWorker(
-                    path.join(__dirname, "worker.service.js"),
-                    {
-                        workerData: {
-                            params: this.params,
-                            index: i,
-                            result: new MeasurementThreadResult(),
-                        },
-                    }
+
+            for (let index = 0; index < this.params.test_numthreads; index++) {
+                const thread = new RMBTThread(this.params, index)
+                this.measurementTasks.push(thread)
+            }
+
+            await Promise.all(
+                this.measurementTasks.map((t) =>
+                    t.connect(new MeasurementThreadResult())
                 )
-                if (worker) {
-                    this.measurementTasks.push(worker)
-                }
-            }
-            for (const [index, worker] of this.measurementTasks.entries()) {
-                worker.postMessage(new IncomingMessageWithData("connect"))
-                worker.on("message", (message) => {
-                    switch (message.message) {
-                        case "connected":
-                            const isInitialized = message.data as boolean
-                            if (isInitialized) {
-                                Logger.I.warn(`Worker ${index} is ready`)
-                                this.initializedThreads.push(index)
-                            } else {
-                                Logger.I.warn(
-                                    `Worker ${index} errored out. Reattempting connection.`
-                                )
-                                setImmediate(() => {
-                                    worker.postMessage(
-                                        new IncomingMessageWithData("connect")
-                                    )
-                                })
-                            }
-                            if (
-                                this.initializedThreads.length ===
-                                this.measurementTasks.length
-                            ) {
-                                for (const w of this.measurementTasks) {
-                                    w.postMessage(
-                                        new IncomingMessageWithData(
-                                            "preDownload"
-                                        )
-                                    )
-                                }
-                                this.initializedThreads = []
-                                this.measurementStatus =
-                                    EMeasurementStatus.INIT_DOWN
-                                this.phaseStartTimeNs[
-                                    EMeasurementStatus.INIT_DOWN
-                                ] = Time.nowNs()
-                                Logger.I.warn(
-                                    "Init is finished in %d s",
-                                    this.getPhaseDuration(
-                                        EMeasurementStatus.INIT
-                                    )
-                                )
-                            }
-                            break
-                        case "preDownloadFinished":
-                            const { chunkSize, bytesPerSec } =
-                                message.data as IPreDownloadResult
-                            this.chunks.push(chunkSize)
-                            this.bytesPerSecPreDownload.push(bytesPerSec)
-                            Logger.I.warn(
-                                `Worker ${index} finished pre-download with ${this.chunks} speeds.`
-                            )
-                            if (
-                                this.chunks.length ===
-                                this.measurementTasks.length
-                            ) {
-                                this.checkIfShouldUseOneThread(this.chunks)
-                                this.measurementTasks[0].postMessage(
-                                    new IncomingMessageWithData("ping")
-                                )
-                                this.chunks = []
-                                this.measurementStatus = EMeasurementStatus.PING
-                                this.phaseStartTimeNs[EMeasurementStatus.PING] =
-                                    Time.nowNs()
-                                Logger.I.warn(
-                                    "Pre-download is finished in %d s",
-                                    this.getPhaseDuration(
-                                        EMeasurementStatus.INIT_DOWN
-                                    )
-                                )
-                            }
-                            break
-                        case "pingFinished":
-                            this.pingMedian =
-                                ((message.data! as IMeasurementThreadResult)
-                                    .ping_median ?? -1000000) / 1000000
-                            const calculatedChunkSize = this.getChunkSize()
-                            for (const w of this.measurementTasks) {
-                                w.postMessage(
-                                    new IncomingMessageWithData(
-                                        "download",
-                                        calculatedChunkSize
-                                    )
-                                )
-                            }
-                            this.measurementStatus = EMeasurementStatus.DOWN
-                            this.phaseStartTimeNs[EMeasurementStatus.DOWN] =
-                                Time.nowNs()
-                            Logger.I.info(
-                                `The ping median is ${this.pingMedian}ms.`
-                            )
-                            Logger.I.warn(
-                                "Ping is finished in %d s",
-                                this.getPhaseDuration(EMeasurementStatus.PING)
-                            )
-                            break
-                        case "downloadUpdated":
-                            this.interimThreadResults[index] =
-                                message.data! as IMeasurementThreadResult
-                            this.overallResultDown = this.getOverallResult(
-                                this.interimThreadResults,
-                                (threadResult) => threadResult?.down
-                            )
-                            break
-                        case "downloadFinished":
-                            this.threadResults.push(
-                                message.data! as IMeasurementThreadResult
-                            )
-                            if (
-                                this.threadResults.length ===
-                                this.measurementTasks.length
-                            ) {
-                                this.overallResultDown = this.getOverallResult(
-                                    this.threadResults,
-                                    (threadResult) => threadResult?.down
-                                )
-                                this.downThreadResults = [...this.threadResults]
-                                this.threadResults = []
-                                this.interimThreadResults = new Array(
-                                    this.params.test_numthreads
-                                )
-                                for (const w of this.measurementTasks) {
-                                    w.postMessage(
-                                        new IncomingMessageWithData("preUpload")
-                                    )
-                                }
-                                this.measurementStatus =
-                                    EMeasurementStatus.INIT_UP
-                                this.phaseStartTimeNs[
-                                    EMeasurementStatus.INIT_UP
-                                ] = Time.nowNs()
-                                Logger.I.info(
-                                    `Download is finished in ${this.getPhaseDuration(
-                                        EMeasurementStatus.DOWN
-                                    )}s`
-                                )
-                                Logger.I.info(
-                                    `The total download speed is ${this.downloadSpeedTotalMbps}Mbps`
-                                )
-                            }
-                            break
-                        case "preUploadFinished":
-                            this.chunks.push(message.data as number)
-                            Logger.I.warn(
-                                `Worker ${index} finished pre-upload with ${this.chunks} chunks.`
-                            )
-                            if (
-                                this.chunks.length ===
-                                this.measurementTasks.length
-                            ) {
-                                this.checkIfShouldUseOneThread(this.chunks)
-                                for (const w of this.measurementTasks) {
-                                    w.postMessage(
-                                        new IncomingMessageWithData(
-                                            "reconnectForUpload"
-                                        )
-                                    )
-                                }
-                                this.chunks = []
-                                this.measurementStatus = EMeasurementStatus.UP
-                                this.phaseStartTimeNs[EMeasurementStatus.UP] =
-                                    Time.nowNs()
-                                Logger.I.info(
-                                    `Pre-upload is finished in ${this.getPhaseDuration(
-                                        EMeasurementStatus.INIT_UP
-                                    )}s`
-                                )
-                            }
-                            break
-                        case "reconnectedForUpload":
-                            const isReconnected = message.data as boolean
-                            if (isReconnected) {
-                                Logger.I.warn(
-                                    `Worker ${index} is reconnected for upload.`
-                                )
-                                this.initializedThreads.push(index)
-                            } else {
-                                Logger.I.warn(
-                                    `Worker ${index} errored out. Reattempting connection.`
-                                )
-                                setImmediate(() => {
-                                    worker.postMessage(
-                                        new IncomingMessageWithData("connect")
-                                    )
-                                })
-                            }
-                            if (
-                                this.initializedThreads.length ===
-                                this.measurementTasks.length
-                            ) {
-                                this.initializedThreads = []
-                                for (const w of this.measurementTasks) {
-                                    w.postMessage(
-                                        new IncomingMessageWithData("upload")
-                                    )
-                                }
-                            }
-                            break
-                        case "uploadUpdated":
-                            this.interimThreadResults[index] =
-                                message.data! as IMeasurementThreadResult
-                            this.overallResultUp = this.getOverallResult(
-                                this.interimThreadResults,
-                                (threadResult) => threadResult?.up
-                            )
-                            break
-                        case "uploadFinished":
-                            this.threadResults.push(
-                                message.data! as IMeasurementThreadResult
-                            )
-                            if (
-                                this.threadResults.length ===
-                                this.measurementTasks.length
-                            ) {
-                                this.isRunning = false
-                            }
-                            break
-                    }
+            )
+            await Promise.all(this.measurementTasks.map((t) => t.manageInit()))
+            this.measurementStatus = EMeasurementStatus.INIT_DOWN
+            this.phaseStartTimeNs[EMeasurementStatus.INIT_DOWN] = Time.nowNs()
+            Logger.I.warn(
+                "Init is finished in %d s",
+                this.getPhaseDuration(EMeasurementStatus.INIT)
+            )
+            await Promise.all(
+                this.measurementTasks.map(async (thread) => {
+                    const { chunkSize, bytesPerSec } =
+                        await thread?.managePreDownload()
+                    this.chunks.push(chunkSize)
+                    this.bytesPerSecPreDownload.push(bytesPerSec)
                 })
-            }
+            )
+            this.checkIfShouldUseOneThread(this.chunks)
+            this.chunks = []
+            this.measurementStatus = EMeasurementStatus.PING
+            this.phaseStartTimeNs[EMeasurementStatus.PING] = Time.nowNs()
+            Logger.I.warn(
+                "Pre-download is finished in %d s",
+                this.getPhaseDuration(EMeasurementStatus.INIT_DOWN)
+            )
+
+            this.pingMedian =
+                ((await this.measurementTasks[0].managePing()).ping_median ??
+                    -1000000) / 1000000
+            const calculatedChunkSize = this.getChunkSize()
+            this.measurementStatus = EMeasurementStatus.DOWN
+            this.phaseStartTimeNs[EMeasurementStatus.DOWN] = Time.nowNs()
+            Logger.I.info(`The ping median is ${this.pingMedian}ms.`)
+            Logger.I.warn(
+                "Ping is finished in %d s",
+                this.getPhaseDuration(EMeasurementStatus.PING)
+            )
+
+            await Promise.all(
+                this.measurementTasks.map(async (thread, index) => {
+                    thread.interimHandler = (interimResult) => {
+                        this.interimThreadResults[index] = interimResult
+                        this.overallResultDown = this.getOverallResult(
+                            this.interimThreadResults,
+                            (threadResult) => threadResult?.down
+                        )
+                    }
+                    const result = await thread.manageDownload(
+                        calculatedChunkSize
+                    )
+                    this.threadResults.push(result)
+                })
+            )
+
+            this.overallResultDown = this.getOverallResult(
+                this.threadResults,
+                (threadResult) => threadResult?.down
+            )
+            this.downThreadResults = [...this.threadResults]
+            this.threadResults = []
+            this.interimThreadResults = new Array(this.params.test_numthreads)
+            this.measurementStatus = EMeasurementStatus.INIT_UP
+            this.phaseStartTimeNs[EMeasurementStatus.INIT_UP] = Time.nowNs()
+            Logger.I.info(
+                `Download is finished in ${this.getPhaseDuration(
+                    EMeasurementStatus.DOWN
+                )}s`
+            )
+            Logger.I.info(
+                `The total download speed is ${this.downloadSpeedTotalMbps}Mbps`
+            )
+
+            await Promise.all(
+                this.measurementTasks.map((thread) =>
+                    thread.connect(thread.threadResult)
+                )
+            )
+            await Promise.all(
+                this.measurementTasks.map((thread) => thread.manageInit())
+            )
+            await Promise.all(
+                this.measurementTasks.map(async (thread) => {
+                    const chunks = await thread.managePreUpload()
+                    this.chunks.push(chunks)
+                })
+            )
+
+            await new Promise((resolve) => {
+                setTimeout(() => resolve(void 0), 200)
+            })
+
+            // this.checkIfShouldUseOneThread(this.chunks)
+            this.chunks = []
+            this.measurementStatus = EMeasurementStatus.UP
+            this.phaseStartTimeNs[EMeasurementStatus.UP] = Time.nowNs()
+            Logger.I.info(
+                `Pre-upload is finished in ${this.getPhaseDuration(
+                    EMeasurementStatus.INIT_UP
+                )}s`
+            )
+
+            await Promise.all(
+                this.measurementTasks.map((thread) =>
+                    thread.connect(thread.threadResult)
+                )
+            )
+            await Promise.all(
+                this.measurementTasks.map((thread) => thread.manageInit())
+            )
+
+            await Promise.all(
+                this.measurementTasks.map(async (thread, index) => {
+                    thread.interimHandler = (interimResult) => {
+                        this.interimThreadResults[index] = interimResult
+                        this.overallResultUp = this.getOverallResult(
+                            this.interimThreadResults,
+                            (threadResult) => threadResult?.up
+                        )
+                    }
+                    const result = await thread.manageUpload()
+                    this.threadResults.push(result)
+                })
+            )
+            this.isRunning = false
         })
     }
 
@@ -390,10 +285,9 @@ export class RMBTClient {
                     if (index === 0) {
                         return [mt]
                     }
-                    mt.terminate()
                     return acc
                 },
-                [] as RMBTWorker[]
+                [] as RMBTThread[]
             )
         }
     }
